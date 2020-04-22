@@ -39,25 +39,31 @@ action :build do
   unless ::File.exists?(aurfile)
     Chef::Log.debug("Creating build directory")
     d = directory new_resource.builddir do
-      owner "root"
-      group "root"
-      mode 0755
+      owner "nobody"
+      group "nobody"
+      mode 02775
       action :nothing
     end
     d.run_action(:create)
 
+    # http://allanmcrae.com/2015/01/replacing-makepkg-asroot/
+    shell_out("chmod g+ws #{new_resource.builddir}")
+    shell_out("chmod a+w #{new_resource.builddir}")
+    shell_out("setfacl -m u::rwx,g::rwx #{new_resource.builddir}")
+    shell_out("setfacl -d --set u::rwx,g::rwx,o::- #{new_resource.builddir}")
+
     Chef::Log.debug("Retrieving source for #{new_resource.name}")
     r = remote_file "#{new_resource.builddir}/#{new_resource.name}.tar.gz" do
       source "https://aur.archlinux.org/cgit/aur.git/snapshot/#{new_resource.name}.tar.gz"
-      owner "root"
-      group "root"
+      owner "nobody"
+      group "nobody"
       mode 0644
       action :nothing
     end
     r.run_action(:create_if_missing)
 
     Chef::Log.debug("Untarring source package for #{new_resource.name}")
-    e = execute "tar -xf #{new_resource.name}.tar.gz" do
+    e = execute "sudo -u nobody tar -xf #{new_resource.name}.tar.gz" do
       cwd new_resource.builddir
       action :nothing
     end
@@ -67,8 +73,8 @@ action :build do
       Chef::Log.debug("Replacing PKGBUILD with custom version")
       pkgb = cookbook_file "#{new_resource.builddir}/#{new_resource.name}/PKGBUILD" do
         source "PKGBUILD"
-        owner "root"
-        group "root"
+        owner "nobody"
+        group "nobody"
         mode 0644
         action :nothing
       end
@@ -95,7 +101,7 @@ action :build do
     end
 
     Chef::Log.debug("Building package #{new_resource.name}")
-    em = execute "makepkg -s --asroot --noconfirm" do
+    em = execute "sudo -u nobody makepkg -s --noconfirm" do
       cwd ::File.join(new_resource.builddir, new_resource.name)
       creates aurfile
       action :nothing
