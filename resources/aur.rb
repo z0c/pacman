@@ -15,16 +15,129 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
+require 'chef/mixin/shell_out'
+include Chef::Mixin::ShellOut
 
 actions :build, :install
 
 default_action :install
 
-attribute :package_name, :name_attribute => true
-attribute :version, :default => nil
-attribute :builddir, :default => "#{Chef::Config[:file_cache_path]}/builds"
-attribute :options, :kind_of => String
-attribute :pkgbuild_src, :default => false
-attribute :patches, :kind_of => Array, :default => []
-attribute :exists, :default => false
+property :package_name, :name_attribute => true
+property :version, :default => nil
+property :builddir, :default => "#{Chef::Config[:file_cache_path]}/builds"
+property :options, :kind_of => String
+property :pkgbuild_src, :default => false
+property :patches, :kind_of => Array, :default => []
+property :exists, :default => false
+
+action :build do
+  get_pkg_version
+  aurfile = "#{new_resource.builddir}/#{new_resource.name}/#{new_resource.name}-#{new_resource.version}.pkg.tar.xz"
+  package_namespace = new_resource.name[0..1]
+
+  Chef::Log.debug("Checking for #{aurfile}")
+  unless ::File.exists?(aurfile)
+    Chef::Log.debug("Creating build directory")
+    d = directory new_resource.builddir do
+      owner "root"
+      group "root"
+      mode 0755
+      action :nothing
+    end
+    d.run_action(:create)
+
+    Chef::Log.debug("Retrieving source for #{new_resource.name}")
+    r = remote_file "#{new_resource.builddir}/#{new_resource.name}.tar.gz" do
+      source "https://aur.archlinux.org/packages/#{package_namespace}/#{new_resource.name}/#{new_resource.name}.tar.gz"
+      owner "root"
+      group "root"
+      mode 0644
+      action :nothing
+    end
+    r.run_action(:create_if_missing)
+
+    Chef::Log.debug("Untarring source package for #{new_resource.name}")
+    e = execute "tar -xf #{new_resource.name}.tar.gz" do
+      cwd new_resource.builddir
+      action :nothing
+    end
+    e.run_action(:run)
+
+    if new_resource.pkgbuild_src
+      Chef::Log.debug("Replacing PKGBUILD with custom version")
+      pkgb = cookbook_file "#{new_resource.builddir}/#{new_resource.name}/PKGBUILD" do
+        source "PKGBUILD"
+        owner "root"
+        group "root"
+        mode 0644
+        action :nothing
+      end
+      pkgb.run_action(:create)
+    end
+
+    if new_resource.patches.length > 0
+      Chef::Log.debug("Adding new patches")
+      new_resource.patches.each do |patch|
+        pfile = cookbook_file ::File.join(new_resource.builddir, new_resource.name, patch) do
+          source patch
+          mode 0644
+          action :nothing
+        end
+        pfile.run_action(:create)
+      end
+    end
+
+    if new_resource.options
+      Chef::Log.debug("Appending #{new_resource.options} to configure command")
+      opt = Chef::Util::FileEdit.new("#{new_resource.builddir}/#{new_resource.name}/PKGBUILD")
+      opt.search_file_replace(/(.\/configure.+$)/, "\\1 #{new_resource.options}")
+      opt.write_file
+    end
+
+    Chef::Log.debug("Building package #{new_resource.name}")
+    em = execute "makepkg -s --asroot --noconfirm" do
+      cwd ::File.join(new_resource.builddir, new_resource.name)
+      creates aurfile
+      action :nothing
+    end
+    em.run_action(:run)
+    new_resource.updated_by_last_action(true)
+  end
+end
+
+action :install do
+  unless new_resource.exists
+    get_pkg_version
+    execute "install AUR package #{new_resource.name}-#{new_resource.version}" do
+      command "pacman -U --noconfirm  --noprogressbar #{new_resource.builddir}/#{new_resource.name}/#{new_resource.name}-#{new_resource.version}.pkg.tar.xz"
+    end
+    new_resource.updated_by_last_action(true)
+  end
+end
+
+def get_pkg_version
+  v = ''
+  r = ''
+  a = ''
+  if ::File.exists?("#{builddir}/#{name}/PKGBUILD")
+    ::File.open("#{builddir}/#{name}/PKGBUILD").each do |line|
+      v = line.split("=")[1].chomp if line =~ /^pkgver=/
+      r = line.split("=")[1].chomp if line =~ /^pkgrel=/
+      if line =~ /^arch/
+        if line.match 'any'
+          a = 'any'
+        else
+          a = node['kernel']['machine']
+        end
+      end
+    end
+    Chef::Log.debug("Setting version of #{name} to #{v}-#{r}-#{a}")
+    version("#{v}-#{r}-#{a}")
+  end
+end
+
+def load_current_value
+  p = shell_out("pacman -Qi #{new_resource.package_name}")
+  new_resource.exists = p.stdout.include?(new_resource.package_name)
+end
